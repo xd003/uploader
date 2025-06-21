@@ -88,8 +88,6 @@ func uploadFile(botToken, filePath, title, performer, thumbnailPath string,
 
 	// Determine file type based on extension
 	fileExt := strings.ToLower(filepath.Ext(filePath))
-	// Telegram considers .opus files with metadata as audio, without as voice.
-	// We are explicitly providing metadata, so treat it as audio.
 	isAudio := fileExt == ".opus" || fileExt == ".mp3" || fileExt == ".m4a" || fileExt == ".flac" || fileExt == ".wav"
 
 	// Choose the right API endpoint
@@ -126,12 +124,38 @@ func uploadFile(botToken, filePath, title, performer, thumbnailPath string,
 
 		// Add file with proper field name
 		fieldName := "document"
+		fileContentType := "application/octet-stream" // Default content type for documents
+
 		if isAudio {
 			fieldName = "audio"
+			// Explicitly set content type for audio files, especially for .opus
+			// Common audio types: audio/mpeg (for mp3), audio/ogg (for opus, ogg vorbis), audio/aac, etc.
+			// For .opus, audio/ogg is often used, but Telegram might recognize audio/opus better directly.
+			// Let's try audio/opus if it's an .opus file, otherwise rely on standard ones.
+			switch fileExt {
+			case ".opus":
+				fileContentType = "audio/opus"
+			case ".mp3":
+				fileContentType = "audio/mpeg"
+			case ".m4a":
+				fileContentType = "audio/mp4" // M4A can sometimes be audio/aac, but audio/mp4 is common for containers
+			case ".flac":
+				fileContentType = "audio/flac"
+			case ".wav":
+				fileContentType = "audio/wav"
+			default:
+				fileContentType = "application/octet-stream" // Fallback
+			}
 		}
 
 		// Create the form file part for the audio/document
-		fileWriter, err := multipartWriter.CreateFormFile(fieldName, filepath.Base(filePath))
+		// Use CreatePart instead of CreateFormFile to manually set Content-Type header
+		h := make(textproto.MIMEHeader)
+		h.Set("Content-Disposition",
+			fmt.Sprintf(`form-data; name="%s"; filename="%s"`, fieldName, filepath.Base(filePath)))
+		h.Set("Content-Type", fileContentType) // Explicitly set Content-Type for the part
+
+		fileWriter, err := multipartWriter.CreatePart(h)
 		if err != nil {
 			writeErr = err
 			return
@@ -159,7 +183,6 @@ func uploadFile(botToken, filePath, title, performer, thumbnailPath string,
 
 		// Add audio-specific metadata if it's an audio file
 		if isAudio {
-			// Always add title and performer, even if empty, to explicitly signal it's audio
 			formFields["title"] = title
 			formFields["performer"] = performer
 
@@ -167,7 +190,6 @@ func uploadFile(botToken, filePath, title, performer, thumbnailPath string,
 				formFields["duration"] = strconv.Itoa(duration)
 			}
 
-			// Explicitly set supports_streaming for audio
 			formFields["supports_streaming"] = "true"
 		} else if title != "" { // For documents, use caption instead of title
 			formFields["caption"] = title
@@ -194,6 +216,7 @@ func uploadFile(botToken, filePath, title, performer, thumbnailPath string,
 			}
 			defer thumbnailFile.Close()
 
+			// For thumbnail, CreateFormFile is usually fine as Content-Type for images is standard
 			thumbPart, err := multipartWriter.CreateFormFile("thumb", filepath.Base(thumbnailPath))
 			if err != nil {
 				writeErr = err
@@ -302,6 +325,5 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Print the message ID to stdout for capturing by calling program
 	fmt.Println(messageID)
 }
