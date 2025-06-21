@@ -6,6 +6,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/textproto" // Import for MIMEHeader
 	"os"
 	"path/filepath"
 	"strconv"
@@ -14,7 +15,7 @@ import (
 )
 
 const (
-	telegramAPIURL = "https://api.telegram.org/bot"
+	telegramAPIURL          = "https://api.telegram.org/bot"
 	lastUploadTimestampFile = "/opt/docker/repos/musicbot/bot/last_upload.txt"
 )
 
@@ -73,8 +74,8 @@ func checkAndWaitForDelay(delaySeconds int) error {
 	return nil
 }
 
-func uploadFile(botToken, filePath, title, performer, thumbnailPath string, 
-               chatID int64, duration, replyToMessageID int, parseMode string, delaySeconds int) (int, error) {
+func uploadFile(botToken, filePath, title, performer, thumbnailPath string,
+	chatID int64, duration, replyToMessageID int, parseMode string, delaySeconds int) (int, error) {
 	// Check and wait for delay if specified
 	if err := checkAndWaitForDelay(delaySeconds); err != nil {
 		return 0, err
@@ -88,7 +89,7 @@ func uploadFile(botToken, filePath, title, performer, thumbnailPath string,
 	// Determine file type based on extension
 	fileExt := strings.ToLower(filepath.Ext(filePath))
 	isAudio := fileExt != ".zip" && fileExt != ".rar" && fileExt != ".7z"
-	
+
 	// Choose the right API endpoint
 	endpoint := "sendDocument"
 	if isAudio {
@@ -103,96 +104,119 @@ func uploadFile(botToken, filePath, title, performer, thumbnailPath string,
 
 	// Create a pipe to connect the file reader to the form writer
 	pr, pw := io.Pipe()
-	
+
 	// Create multipart writer through the pipe writer
 	multipartWriter := multipart.NewWriter(pw)
-	
+
 	// Start a goroutine to write the file data to the pipe
 	go func() {
 		var writeErr error
-		
+
 		defer func() {
 			// Close the multipart writer first to finalize the form
 			if closeErr := multipartWriter.Close(); closeErr != nil && writeErr == nil {
 				writeErr = closeErr
 			}
-			
+
 			// Close the pipe writer, propagating any error
 			pw.CloseWithError(writeErr)
 		}()
-		
-		// Add file with proper field name
+
+		// --- START MODIFICATION ---
+		// Add file with proper field name and explicit Content-Type
 		fieldName := "document"
 		if isAudio {
 			fieldName = "audio"
 		}
-		
-		fileWriter, err := multipartWriter.CreateFormFile(fieldName, filepath.Base(filePath))
+
+		header := make(textproto.MIMEHeader)
+		header.Set("Content-Disposition", fmt.Sprintf(`form-data; name="%s"; filename="%s"`, fieldName, filepath.Base(filePath)))
+
+		// Set the appropriate Content-Type for the audio file part
+		// For .opus files, audio/ogg is the standard MIME type.
+		// This is crucial for Telegram to correctly identify it as audio.
+		if isAudio {
+			switch fileExt {
+			case ".mp3":
+				header.Set("Content-Type", "audio/mpeg")
+			case ".m4a":
+				header.Set("Content-Type", "audio/mp4")
+			case ".opus":
+				header.Set("Content-Type", "audio/ogg") // Explicitly set for opus
+			default:
+				header.Set("Content-Type", "application/octet-stream") // Fallback
+			}
+		} else {
+			header.Set("Content-Type", "application/octet-stream") // Default for documents
+		}
+
+		fileWriter, err := multipartWriter.CreatePart(header)
 		if err != nil {
 			writeErr = err
 			return
 		}
-		
+		// --- END MODIFICATION ---
+
 		// Copy file data
 		if _, writeErr = io.Copy(fileWriter, file); writeErr != nil {
 			return
 		}
-		
+
 		// Add common metadata
 		formFields := map[string]string{
 			"chat_id": strconv.FormatInt(chatID, 10),
 		}
-		
+
 		// Only add reply_to_message_id if it's not 0
 		if replyToMessageID != 0 {
 			formFields["reply_to_message_id"] = strconv.Itoa(replyToMessageID)
 		}
-		
+
 		// Add parse_mode if provided
 		if parseMode != "" {
 			formFields["parse_mode"] = parseMode
 		}
-		
+
 		// Add audio-specific metadata if it's an audio file
 		if isAudio {
 			if title != "" {
 				formFields["title"] = title
 			}
-			
+
 			if performer != "" {
 				formFields["performer"] = performer
 			}
-			
+
 			if duration > 0 {
 				formFields["duration"] = strconv.Itoa(duration)
 			}
-			
+
 			formFields["supports_streaming"] = "true"
 		} else if title != "" { // For documents, use caption instead of title
 			formFields["caption"] = title
 		}
-		
+
 		for key, value := range formFields {
 			if err := multipartWriter.WriteField(key, value); err != nil {
 				writeErr = err
 				return
 			}
 		}
-		
+
 		// Add thumbnail if provided
 		if thumbnailPath != "" {
 			if _, err := os.Stat(thumbnailPath); os.IsNotExist(err) {
 				writeErr = fmt.Errorf("thumbnail file does not exist: %s", thumbnailPath)
 				return
 			}
-			
+
 			thumbnailFile, err := os.Open(thumbnailPath)
 			if err != nil {
 				writeErr = err
 				return
 			}
 			defer thumbnailFile.Close()
-			
+
 			thumbPart, err := multipartWriter.CreateFormFile("thumb", filepath.Base(thumbnailPath))
 			if err != nil {
 				writeErr = err
@@ -204,7 +228,7 @@ func uploadFile(botToken, filePath, title, performer, thumbnailPath string,
 			}
 		}
 	}()
-	
+
 	// Create and send HTTP request
 	url := fmt.Sprintf("%s%s/%s", telegramAPIURL, botToken, endpoint)
 	req, err := http.NewRequest("POST", url, pr)
@@ -212,7 +236,7 @@ func uploadFile(botToken, filePath, title, performer, thumbnailPath string,
 		return 0, fmt.Errorf("failed to create request: %v", err)
 	}
 	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
-	
+
 	// Set a longer timeout for large uploads
 	client := &http.Client{
 		Timeout: 10 * time.Minute,
@@ -230,16 +254,16 @@ func uploadFile(botToken, filePath, title, performer, thumbnailPath string,
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return 0, fmt.Errorf("failed to decode response: %v", err)
 	}
-	
+
 	if !result.OK {
 		return 0, fmt.Errorf("telegram API error: %s", result.Description)
 	}
-	
+
 	// Write the last upload timestamp
 	if err := writeLastUploadTime(); err != nil {
 		return 0, fmt.Errorf("failed to write last upload timestamp: %v", err)
 	}
-	
+
 	return result.Result.MessageID, nil
 }
 
@@ -248,41 +272,41 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Usage: uploader <bot_token> <chat_id> <file_path> <title> <performer> <duration> <reply_to_message_id> [thumbnail_path] [parse_mode] [delay_seconds]\n")
 		os.Exit(1)
 	}
-	
+
 	botToken := os.Args[1]
-	
+
 	chatID, err := strconv.ParseInt(os.Args[2], 10, 64)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Invalid chat ID: %v\n", err)
 		os.Exit(1)
 	}
-	
+
 	filePath := os.Args[3]
 	title := os.Args[4]
 	performer := os.Args[5]
-	
+
 	duration, err := strconv.Atoi(os.Args[6])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Invalid duration: %v\n", err)
 		os.Exit(1)
 	}
-	
+
 	replyToMessageID, err := strconv.Atoi(os.Args[7])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Invalid reply_to_message_id: %v\n", err)
 		os.Exit(1)
 	}
-	
+
 	thumbnailPath := ""
 	if len(os.Args) > 8 {
 		thumbnailPath = os.Args[8]
 	}
-	
+
 	parseMode := ""
 	if len(os.Args) > 9 {
 		parseMode = os.Args[9]
 	}
-	
+
 	delaySeconds := 0
 	if len(os.Args) > 10 {
 		delaySeconds, err = strconv.Atoi(os.Args[10])
@@ -291,13 +315,13 @@ func main() {
 			os.Exit(1)
 		}
 	}
-	
+
 	messageID, err := uploadFile(botToken, filePath, title, performer, thumbnailPath, chatID, duration, replyToMessageID, parseMode, delaySeconds)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error uploading file: %v\n", err)
 		os.Exit(1)
 	}
-	
+
 	// Print the message ID to stdout for capturing by calling program
 	fmt.Println(messageID)
 }
