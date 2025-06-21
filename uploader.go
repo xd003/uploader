@@ -6,6 +6,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/textproto" // <--- ADD THIS IMPORT
 	"os"
 	"path/filepath"
 	"strconv"
