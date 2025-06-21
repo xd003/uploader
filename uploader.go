@@ -1,12 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
-	"net/textproto"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -96,131 +96,99 @@ func uploadFile(botToken, filePath, title, performer, thumbnailPath string,
 		endpoint = "sendAudio"
 	}
 
+	// Read the file
 	file, err := os.Open(filePath)
 	if err != nil {
 		return 0, fmt.Errorf("failed to open file: %v", err)
 	}
 	defer file.Close()
 
-	// Create a pipe to connect the file reader to the form writer
-	pr, pw := io.Pipe()
+	// Create a buffer to store the multipart form data
+	var buf bytes.Buffer
+	multipartWriter := multipart.NewWriter(&buf)
+
+	// Add the file
+	fieldName := "document"
+	if isAudio {
+		fieldName = "audio"
+	}
 	
-	// Create multipart writer through the pipe writer
-	multipartWriter := multipart.NewWriter(pw)
+	fileWriter, err := multipartWriter.CreateFormFile(fieldName, filepath.Base(filePath))
+	if err != nil {
+		return 0, fmt.Errorf("failed to create form file: %v", err)
+	}
 	
-	// Start a goroutine to write the file data to the pipe
-	go func() {
-		var writeErr error
-		
-		defer func() {
-			// Close the multipart writer first to finalize the form
-			if closeErr := multipartWriter.Close(); closeErr != nil && writeErr == nil {
-				writeErr = closeErr
-			}
-			
-			// Close the pipe writer, propagating any error
-			pw.CloseWithError(writeErr)
-		}()
-		
-		// Add file with proper field name and explicit MIME type
-		fieldName := "document"
-		if isAudio {
-			fieldName = "audio"
+	_, err = io.Copy(fileWriter, file)
+	if err != nil {
+		return 0, fmt.Errorf("failed to copy file: %v", err)
+	}
+
+	// Add form fields
+	formFields := map[string]string{
+		"chat_id": strconv.FormatInt(chatID, 10),
+	}
+	
+	// Only add reply_to_message_id if it's not 0
+	if replyToMessageID != 0 {
+		formFields["reply_to_message_id"] = strconv.Itoa(replyToMessageID)
+	}
+	
+	// Add parse_mode if provided
+	if parseMode != "" {
+		formFields["parse_mode"] = parseMode
+	}
+	
+	// Add audio-specific metadata if it's an audio file
+	if isAudio {
+		if title != "" {
+			formFields["title"] = title
 		}
 		
-		// Create form file with explicit MIME type for audio files
-		var fileWriter io.Writer
-		if isAudio && fileExt == ".opus" {
-			// Explicitly set MIME type for opus files
-			h := make(textproto.MIMEHeader)
-			h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="%s"; filename="%s"`, fieldName, filepath.Base(filePath)))
-			h.Set("Content-Type", "audio/ogg")
-			fileWriter, err = multipartWriter.CreatePart(h)
-		} else {
-			fileWriter, err = multipartWriter.CreateFormFile(fieldName, filepath.Base(filePath))
+		if performer != "" {
+			formFields["performer"] = performer
 		}
 		
+		if duration > 0 {
+			formFields["duration"] = strconv.Itoa(duration)
+		}
+	} else if title != "" { // For documents, use caption instead of title
+		formFields["caption"] = title
+	}
+	
+	// Write all form fields
+	for key, value := range formFields {
+		if err := multipartWriter.WriteField(key, value); err != nil {
+			return 0, fmt.Errorf("failed to write field %s: %v", key, err)
+		}
+	}
+	
+	// Add thumbnail if provided
+	if thumbnailPath != "" {
+		if _, err := os.Stat(thumbnailPath); os.IsNotExist(err) {
+			return 0, fmt.Errorf("thumbnail file does not exist: %s", thumbnailPath)
+		}
+		
+		thumbnailFile, err := os.Open(thumbnailPath)
 		if err != nil {
-			writeErr = err
-			return
+			return 0, fmt.Errorf("failed to open thumbnail: %v", err)
 		}
+		defer thumbnailFile.Close()
 		
-		// Copy file data
-		if _, writeErr = io.Copy(fileWriter, file); writeErr != nil {
-			return
+		thumbPart, err := multipartWriter.CreateFormFile("thumb", filepath.Base(thumbnailPath))
+		if err != nil {
+			return 0, fmt.Errorf("failed to create thumbnail form file: %v", err)
 		}
-		
-		// Add common metadata
-		formFields := map[string]string{
-			"chat_id": strconv.FormatInt(chatID, 10),
+		if _, err = io.Copy(thumbPart, thumbnailFile); err != nil {
+			return 0, fmt.Errorf("failed to copy thumbnail: %v", err)
 		}
-		
-		// Only add reply_to_message_id if it's not 0
-		if replyToMessageID != 0 {
-			formFields["reply_to_message_id"] = strconv.Itoa(replyToMessageID)
-		}
-		
-		// Add parse_mode if provided
-		if parseMode != "" {
-			formFields["parse_mode"] = parseMode
-		}
-		
-		// Add audio-specific metadata if it's an audio file
-		if isAudio {
-			if title != "" {
-				formFields["title"] = title
-			}
-			
-			if performer != "" {
-				formFields["performer"] = performer
-			}
-			
-			if duration > 0 {
-				formFields["duration"] = strconv.Itoa(duration)
-			}
-			
-			formFields["supports_streaming"] = "true"
-		} else if title != "" { // For documents, use caption instead of title
-			formFields["caption"] = title
-		}
-		
-		// Write all form fields
-		for key, value := range formFields {
-			if err := multipartWriter.WriteField(key, value); err != nil {
-				writeErr = err
-				return
-			}
-		}
-		
-		// Add thumbnail if provided
-		if thumbnailPath != "" {
-			if _, err := os.Stat(thumbnailPath); os.IsNotExist(err) {
-				writeErr = fmt.Errorf("thumbnail file does not exist: %s", thumbnailPath)
-				return
-			}
-			
-			thumbnailFile, err := os.Open(thumbnailPath)
-			if err != nil {
-				writeErr = err
-				return
-			}
-			defer thumbnailFile.Close()
-			
-			thumbPart, err := multipartWriter.CreateFormFile("thumb", filepath.Base(thumbnailPath))
-			if err != nil {
-				writeErr = err
-				return
-			}
-			if _, err = io.Copy(thumbPart, thumbnailFile); err != nil {
-				writeErr = err
-				return
-			}
-		}
-	}()
+	}
+	
+	// Close the multipart writer
+	multipartWriter.Close()
 	
 	// Create and send HTTP request
 	url := fmt.Sprintf("%s%s/%s", telegramAPIURL, botToken, endpoint)
-	req, err := http.NewRequest("POST", url, pr)
+	req, err := http.NewRequest("POST", url, &buf)
 	if err != nil {
 		return 0, fmt.Errorf("failed to create request: %v", err)
 	}
